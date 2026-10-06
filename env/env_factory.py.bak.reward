@@ -1,0 +1,275 @@
+"""Environment factory functions.
+
+These helpers construct Habitat-Lab Social Rearrangement environments and
+wrap them with :class:`VectorObservationWrapper`. Habitat-Lab is an
+*optional* dependency: when it is not installed (e.g., on a CI runner or
+unit-test machine), a lightweight stub environment with the same
+observation contract is returned. This keeps the codebase importable and
+testable while remaining production-correct on a real Habitat install.
+"""
+
+from __future__ import annotations
+
+from typing import Callable, List, Optional, Sequence
+
+import os
+import gymnasium as gym
+import numpy as np
+import torch
+
+from llm_toc.config import EnvConfig
+from llm_toc.env.habitat_wrapper import (
+    HabitatVectorEnv,
+    MissionProvider,
+    VectorObservationWrapper,
+)
+
+
+# Backend used by the most recent :func:`make_env` call.
+# "habitat" = real simulator, "stub" = Habitat-free fallback.
+ENV_BACKEND = "unknown"
+
+
+def _habitat_available() -> bool:
+    """Return True if habitat-lab is importable.
+
+    Only ``habitat`` is required for environment construction.
+    ``habitat_baselines`` is optional (needed only for RL trainers).
+    """
+    try:
+        import habitat  # noqa: F401
+        from habitat.gym.gym_definitions import make_gym_from_config  # noqa: F401
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Real Habitat construction
+# ---------------------------------------------------------------------------
+def _build_habitat_env(cfg: EnvConfig, seed: int) -> gym.Env:
+    """Construct a real Habitat Social Rearrangement environment.
+
+    Uses the habitat-lab 0.3.x gym API (``habitat.gym.gym_definitions``).
+
+    Args:
+        cfg: Environment configuration.
+        seed: RNG seed for reproducibility.
+
+    Returns:
+        A gym-compatible Habitat environment.
+
+    Raises:
+        ImportError: If habitat-lab is not installed.
+        RuntimeError: If the scene dataset or config is not found.
+    """
+    import os
+
+    from habitat.gym.gym_definitions import get_config, make_gym_from_config
+
+    # --- 1. Locate the Habitat config file -------------------------------
+    # Use habitat-native config which doesn't require habitat_baselines.
+    # habitat-baselines configs (like pop_play.yaml) have Hydra defaults
+    # that reference hierarchical policy definitions which may not be available.
+    config_path = "benchmark/rearrange/multi_task/rearrange_easy.yaml"
+
+    # --- 2. Load config with data path override --------------------------
+    data_path = os.environ.get(
+        "HABITAT_DATA_PATH",
+        "/home/yutianqi/data",
+    )
+    # Use ReplicaCAD dataset for rearrange tasks
+    overrides = [
+        f"habitat.dataset.data_path={data_path}/datasets/replica_cad/rearrange/v2/train/rearrange_easy.json.gz",
+        f"habitat.dataset.scenes_dir={data_path}/versioned_data/replica_cad_dataset",
+        f"habitat.simulator.scene_dataset={data_path}/versioned_data/replica_cad_dataset/replicaCAD.scene_dataset_config.json",
+        f"habitat.seed={seed}",
+    ]
+
+    # Habitat-Sim selects its EGL device from ``gpu_device_id`` and ignores
+    # ``CUDA_VISIBLE_DEVICES``. Allow spreading workers across GPUs so they
+    # do not all pile onto GPU 0.
+    gpu_device_id = os.environ.get("LLM_TOC_GPU_DEVICE_ID")
+    if gpu_device_id:
+        overrides.append(
+            "habitat.simulator.habitat_sim_v0.gpu_device_id=%s" % gpu_device_id
+        )
+
+    habitat_cfg = get_config(config_path, overrides=overrides)
+
+    # --- 3. Create the gym environment -----------------------------------
+    return make_gym_from_config(habitat_cfg)
+
+
+# ---------------------------------------------------------------------------
+# Stub environment (Habitat-free fallback)
+# ---------------------------------------------------------------------------
+class _StubSocialRearrangementEnv(gym.Env):
+    """Deterministic stub mirroring the Habitat observation contract.
+
+    Produces dictionary observations with ``agent_states`` (length 2),
+    ``objects`` (up to ``EnvConfig.max_objects``), and discrete action
+    space. Used for unit tests and CI when Habitat is unavailable.
+    """
+
+    metadata = {"render_modes": []}
+
+    def __init__(self, cfg: EnvConfig, seed: int) -> None:
+        super().__init__()
+        self.cfg = cfg
+        self.seed = seed
+        self._rng = np.random.default_rng(seed)
+        self._step = 0
+        self._max_steps = cfg.max_episode_steps
+        self.observation_space = gym.spaces.Dict({
+            "agent_states": gym.spaces.Tuple(
+                (gym.spaces.Dict({
+                    "position": gym.spaces.Box(-10, 10, (3,), np.float32),
+                    "rotation": gym.spaces.Box(-1, 1, (4,), np.float32),
+                    "end_effector": gym.spaces.Box(-10, 10, (3,), np.float32),
+                    "gripper": gym.spaces.Box(0, 1, (1,), np.float32),
+                }),) * 2
+            ),
+            "objects": gym.spaces.Dict({
+                "position": gym.spaces.Box(-10, 10, (3,), np.float32),
+                "target_position": gym.spaces.Box(-10, 10, (3,), np.float32),
+            }),
+        })
+        # Continuous base-velocity action (linear, angular) matching the
+        # Gaussian actor in :mod:`llm_toc.models.actor_critic`.
+        self.action_space = gym.spaces.Box(
+            low=np.array([-1.0, -1.0], dtype=np.float32),
+            high=np.array([1.0, 1.0], dtype=np.float32),
+            dtype=np.float32,
+        )
+        self._agent_pos = np.zeros((2, 3), dtype=np.float32)
+        self._objects = self._init_objects()
+
+    def _init_objects(self) -> List[dict]:
+        n = self._rng.integers(1, self.cfg.max_objects + 1)
+        objs = []
+        for _ in range(int(n)):
+            objs.append({
+                "position": self._rng.uniform(-2, 2, 3).astype(np.float32),
+                "target_position": self._rng.uniform(-2, 2, 3).astype(np.float32),
+            })
+        return objs
+
+    def reset(self, *, seed: Optional[int] = None,
+              options: Optional[dict] = None):
+        if seed is not None:
+            self._rng = np.random.default_rng(seed)
+        self._step = 0
+        self._agent_pos = self._rng.uniform(-1, 1, (2, 3)).astype(np.float32)
+        self._objects = self._init_objects()
+        return self._build_obs(), {}
+
+    def _build_obs(self) -> dict:
+        agent_states = []
+        for i in range(2):
+            agent_states.append({
+                "position": self._agent_pos[i],
+                "rotation": np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+                "end_effector": self._agent_pos[i] + np.array(
+                    [0.0, 0.0, 0.5], dtype=np.float32),
+                "gripper": 0.0,
+            })
+        return {"agent_states": agent_states, "objects": self._objects}
+
+    def step(self, action):
+        self._step += 1
+        # ``action`` is a (2,) base-velocity command [linear, angular] for
+        # the first agent; the co-agent mirrors it. We apply it to the
+        # forward direction so the stub is responsive to the policy.
+        action = np.asarray(action, dtype=np.float32).reshape(-1)
+        linear = float(action[0]) if action.size > 0 else 0.0
+        delta = np.array([linear, 0.0, 0.0], dtype=np.float32) * 0.1
+        self._agent_pos += delta[None, :].repeat(2, axis=0)
+        # Add a small stochastic perturbation so the env is non-trivial.
+        self._agent_pos += self._rng.normal(0, 0.02, self._agent_pos.shape
+                                            ).astype(np.float32)
+        # Slowly pull objects toward their targets.
+        for o in self._objects:
+            o["position"] = 0.9 * np.asarray(o["position"]) + 0.1 * np.asarray(
+                o["target_position"])
+        reward = float(-0.01)
+        terminated = False
+        truncated = self._step >= self._max_steps
+        info = {"success": truncated and self._rng.random() < 0.1}
+        if truncated:
+            reward = 1.0 if info["success"] else 0.0
+        return self._build_obs(), reward, terminated, truncated, info
+
+    def close(self) -> None:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Public factory
+# ---------------------------------------------------------------------------
+def make_env(
+    cfg: EnvConfig,
+    seed: int,
+    mission_provider: Optional[MissionProvider] = None,
+    device: Optional[torch.device] = None,
+) -> gym.Env:
+    """Construct a single Habitat (or stub) env wrapped with vector obs.
+
+    Args:
+        cfg: Environment configuration.
+        seed: RNG seed.
+        mission_provider: Optional mission embedding provider.
+        device: Torch device for observation tensors.
+
+    Returns:
+        A :class:`VectorObservationWrapper`-wrapped gym environment.
+    """
+    if _habitat_available():
+        base_env = _build_habitat_env(cfg, seed)
+        env_backend = "habitat"
+    else:
+        # Habitat is unavailable. Fall back to the deterministic stub only
+        # when explicitly allowed, so that a broken simulator never
+        # silently produces fast, meaningless "real environment" curves.
+        if os.environ.get("LLM_TOC_ALLOW_STUB", "0") != "1":
+            raise RuntimeError(
+                "habitat is not importable; refusing to fall back to the "
+                "stub environment. Set LLM_TOC_ALLOW_STUB=1 to opt in."
+            )
+        base_env = _StubSocialRearrangementEnv(cfg, seed)
+        env_backend = "stub"
+    # Record the backend so runs can be attributed after the fact.
+    global ENV_BACKEND
+    ENV_BACKEND = env_backend
+    print("[ENV_BACKEND] %s" % env_backend, flush=True)
+    return VectorObservationWrapper(
+        env=base_env,
+        cfg=cfg,
+        mission_provider=mission_provider,
+        num_agents=2,
+        device=device or torch.device("cpu"),
+    )
+
+
+def make_vec_env(
+    cfg: EnvConfig,
+    num_envs: int,
+    base_seed: int,
+    mission_provider: Optional[MissionProvider] = None,
+    device: Optional[torch.device] = None,
+) -> HabitatVectorEnv:
+    """Construct a :class:`HabitatVectorEnv` of ``num_envs`` sub-envs.
+
+    Each sub-environment is created by a closure that calls
+    :func:`make_env` with a distinct seed (``base_seed + i``).
+    """
+    env_fns: List[Callable[[], gym.Env]] = [
+        (lambda s=seed_i: make_env(cfg, s, mission_provider, device))
+        for seed_i in range(base_seed, base_seed + num_envs)
+    ]
+    return HabitatVectorEnv(
+        env_fns=env_fns,
+        cfg=cfg,
+        mission_provider=mission_provider,
+        device=device or torch.device("cpu"),
+    )

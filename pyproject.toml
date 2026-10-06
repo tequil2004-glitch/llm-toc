@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llm_toc"
+version = "0.1.0"
+description = "LLM-TOC hierarchical multi-agent reinforcement learning system"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0",
+    "gymnasium>=0.28",
+    "numpy>=1.24",
+    "tensorboard>=2.15",
+    "hydra-core>=1.3",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
